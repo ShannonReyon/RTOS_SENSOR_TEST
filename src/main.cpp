@@ -1,75 +1,92 @@
 #include <Arduino.h>
+#include <Wire.h>
+#include "hyt939.h"
 
-TaskHandle_t task1Handle = nullptr;
-TaskHandle_t task2Handle = nullptr;
+// ---------------- CONFIG ----------------
+constexpr uint32_t HYT_PERIOD_MS = 100;   // 10 Hz
+constexpr uint32_t STACK_SIZE    = 4096;
+constexpr UBaseType_t PRIORITY   = 1;
+constexpr BaseType_t CORE        = 1;
 
-// -----------------------------
-// Task 1
-// -----------------------------
-void taskSensorA(void *pvParameters)
+// ---------------- DRIVER INSTANCE ----------------
+HYT939 hyt;
+
+// ---------------- TASK ----------------
+void taskHYT(void *pvParameters)
 {
-    const TickType_t period = pdMS_TO_TICKS(1000); // 1 second
+    const TickType_t period = pdMS_TO_TICKS(100);   // 10 Hz
+    const TickType_t conversionDelay = pdMS_TO_TICKS(100);
+
     TickType_t lastWakeTime = xTaskGetTickCount();
 
     while (true)
     {
-        Serial.printf("[Task A] Running on core %d, tick = %lu ms\n",
-                      xPortGetCoreID(),
-                      (unsigned long)millis());
+        uint8_t status = 0;
+        float humidity = 0.0f;
+        float temperature = 0.0f;
+
+        // -------- Phase 1: trigger --------
+        bool trig_ok = hyt.trigger();
+
+        // Wait for sensor conversion (non-blocking!)
+        vTaskDelay(conversionDelay);
+
+        // -------- Phase 2: read --------
+        bool read_ok = hyt.readResult(status, humidity, temperature);
+
+        uint32_t t_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+        if (trig_ok && read_ok)
+        {
+            Serial.printf(
+                "[HYT939] t=%lu ms | RH=%.2f %% | T=%.2f C\n",
+                t_ms,
+                humidity,
+                temperature
+            );
+        }
+        else
+        {
+            Serial.printf("[HYT939] t=%lu ms | ERROR\n", t_ms);
+        }
 
         vTaskDelayUntil(&lastWakeTime, period);
     }
 }
 
-// -----------------------------
-// Task 2
-// -----------------------------
-void taskSensorB(void *pvParameters)
-{
-    const TickType_t period = pdMS_TO_TICKS(500); // 500 ms
-    TickType_t lastWakeTime = xTaskGetTickCount();
-
-    while (true)
-    {
-        Serial.printf("[Task B] Running on core %d, tick = %lu ms\n",
-                      xPortGetCoreID(),
-                      (unsigned long)millis());
-
-        vTaskDelayUntil(&lastWakeTime, period);
-    }
-}
-
+// ---------------- SETUP ----------------
 void setup()
 {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\nStarting FreeRTOS task test...");
+    Serial.println("\n=== HYT939 FreeRTOS Test ===");
+
+    Wire.begin();
+
+    if (!hyt.begin(Wire, 0x28))
+    {
+        Serial.println("HYT939 init failed!");
+        while (true)
+        {
+            delay(1000);
+        }
+    }
+
+    Serial.println("HYT939 initialized.");
 
     xTaskCreatePinnedToCore(
-        taskSensorA,     // task function
-        "TaskSensorA",   // name
-        4096,            // stack size
-        nullptr,         // parameter
-        1,               // priority
-        &task1Handle,    // handle
-        1                // core
-    );
-
-    xTaskCreatePinnedToCore(
-        taskSensorB,
-        "TaskSensorB",
-        4096,
+        taskHYT,
+        "HYT_Task",
+        STACK_SIZE,
         nullptr,
-        1,
-        &task2Handle,
-        1
+        PRIORITY,
+        nullptr,
+        CORE
     );
-
-    Serial.println("Tasks created.");
 }
 
+// ---------------- LOOP ----------------
 void loop()
 {
-    // Intentionally unused.
-    vTaskDelete(nullptr); // delete Arduino loop task
+    vTaskDelete(nullptr);  // kill Arduino loop task
 }
