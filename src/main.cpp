@@ -3,53 +3,101 @@
 #include "hyt939.h"
 
 // ---------------- CONFIG ----------------
-constexpr uint32_t HYT_PERIOD_MS = 100;   // 10 Hz
-constexpr uint32_t STACK_SIZE    = 4096;
-constexpr UBaseType_t PRIORITY   = 1;
-constexpr BaseType_t CORE        = 1;
+constexpr uint32_t HYT_PERIOD_MS = 120;   // ~8.33 Hz, leaves time for sensor conversion
+constexpr uint32_t HEARTBEAT_PERIOD_MS = 1000;
+constexpr uint32_t STACK_SIZE = 4096;
+constexpr uint32_t HEARTBEAT_STACK_SIZE = 2048;
+constexpr uint32_t LOGGER_STACK_SIZE = 4096;
+constexpr UBaseType_t SENSOR_PRIORITY = 2;
+constexpr UBaseType_t LOGGER_PRIORITY = 1;
+constexpr UBaseType_t HEARTBEAT_PRIORITY = 1;
+constexpr BaseType_t CORE = 1;
+constexpr uint8_t HYT_I2C_ADDRESS = 0x28;
+constexpr size_t HYT_QUEUE_LENGTH = 10;
+
+// ---------------- DATA TYPES ----------------
+struct HYTSample
+{
+    uint32_t timestamp_ms;
+    uint8_t status;
+    float humidity_percent;
+    float temperature_c;
+    bool valid;
+};
 
 // ---------------- DRIVER INSTANCE ----------------
 HYT939 hyt;
+QueueHandle_t hytQueue = nullptr;
 
-// ---------------- TASK ----------------
+// ---------------- TASKS ----------------
 void taskHYT(void *pvParameters)
 {
-    const TickType_t period = pdMS_TO_TICKS(100);   // 10 Hz
+    const TickType_t period = pdMS_TO_TICKS(HYT_PERIOD_MS);
     const TickType_t conversionDelay = pdMS_TO_TICKS(100);
-
     TickType_t lastWakeTime = xTaskGetTickCount();
 
     while (true)
     {
-        uint8_t status = 0;
-        float humidity = 0.0f;
-        float temperature = 0.0f;
+        HYTSample sample{};
 
-        // -------- Phase 1: trigger --------
         bool trig_ok = hyt.trigger();
-
-        // Wait for sensor conversion (non-blocking!)
         vTaskDelay(conversionDelay);
 
-        // -------- Phase 2: read --------
-        bool read_ok = hyt.readResult(status, humidity, temperature);
+        sample.timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        sample.valid = trig_ok && hyt.readResult(sample.status,
+                                                 sample.humidity_percent,
+                                                 sample.temperature_c);
 
-        uint32_t t_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-
-        if (trig_ok && read_ok)
+        if (hytQueue != nullptr)
         {
-            Serial.printf(
-                "[HYT939] t=%lu ms | RH=%.2f %% | T=%.2f C\n",
-                t_ms,
-                humidity,
-                temperature
-            );
-        }
-        else
-        {
-            Serial.printf("[HYT939] t=%lu ms | ERROR\n", t_ms);
+            BaseType_t queued = xQueueSend(hytQueue, &sample, 0);
+            if (queued != pdPASS)
+            {
+                Serial.printf("[HYT939] t=%lu ms | QUEUE FULL\n",
+                              static_cast<unsigned long>(sample.timestamp_ms));
+            }
         }
 
+        vTaskDelayUntil(&lastWakeTime, period);
+    }
+}
+
+void taskLogger(void *pvParameters)
+{
+    HYTSample sample{};
+
+    while (true)
+    {
+        if (xQueueReceive(hytQueue, &sample, portMAX_DELAY) == pdPASS)
+        {
+            if (sample.valid)
+            {
+                Serial.printf(
+                    "[HYT939] t=%lu ms | status=%u | RH=%.2f %% | T=%.2f C\n",
+                    static_cast<unsigned long>(sample.timestamp_ms),
+                    sample.status,
+                    sample.humidity_percent,
+                    sample.temperature_c);
+            }
+            else
+            {
+                Serial.printf("[HYT939] t=%lu ms | ERROR\n",
+                              static_cast<unsigned long>(sample.timestamp_ms));
+            }
+        }
+    }
+}
+
+void taskHeartbeat(void *pvParameters)
+{
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(HEARTBEAT_PERIOD_MS);
+
+    while (true)
+    {
+        const uint32_t timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        Serial.printf("[Heartbeat] t=%lu ms | system alive\n",
+                      static_cast<unsigned long>(timestamp_ms));
         vTaskDelayUntil(&lastWakeTime, period);
     }
 }
@@ -59,11 +107,11 @@ void setup()
 {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n=== HYT939 FreeRTOS Test ===");
+    Serial.println("\n=== HYT939 FreeRTOS Queue Test ===");
 
     Wire.begin();
 
-    if (!hyt.begin(Wire, 0x28))
+    if (!hyt.begin(Wire, HYT_I2C_ADDRESS))
     {
         Serial.println("HYT939 init failed!");
         while (true)
@@ -72,17 +120,45 @@ void setup()
         }
     }
 
+    hytQueue = xQueueCreate(HYT_QUEUE_LENGTH, sizeof(HYTSample));
+    if (hytQueue == nullptr)
+    {
+        Serial.println("Failed to create HYT queue!");
+        while (true)
+        {
+            delay(1000);
+        }
+    }
+
     Serial.println("HYT939 initialized.");
+    Serial.println("Queue created.");
 
     xTaskCreatePinnedToCore(
         taskHYT,
         "HYT_Task",
         STACK_SIZE,
         nullptr,
-        PRIORITY,
+        SENSOR_PRIORITY,
         nullptr,
-        CORE
-    );
+        CORE);
+
+    xTaskCreatePinnedToCore(
+        taskLogger,
+        "Logger_Task",
+        LOGGER_STACK_SIZE,
+        nullptr,
+        LOGGER_PRIORITY,
+        nullptr,
+        CORE);
+
+    xTaskCreatePinnedToCore(
+        taskHeartbeat,
+        "Heartbeat_Task",
+        HEARTBEAT_STACK_SIZE,
+        nullptr,
+        HEARTBEAT_PRIORITY,
+        nullptr,
+        CORE);
 }
 
 // ---------------- LOOP ----------------
